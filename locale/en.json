@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex 429 Auto-Resume",
+    "description": "Watches the Codex app for upstream 429 stalls and presses Continue for you."
+  }
+}

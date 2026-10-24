@@ -1,0 +1,7 @@
+# 往当前 profile 的 loader 树里插一条 codex-429-nudge。
+# id 必须等于包导出的 name，DSH 靠它对上配置。
+# 开关与节奏不放这里的 config：插件自己存 ~/.dsh/codex-429-nudge/config.json，
+# 设置页通过 /api/codex-429-nudge/config 读写（DSH 的 Config user 层不跟插件写入更新）。
+- insert:
+    - id: codex-429-nudge
+      name: dsh-codex-429-nudge

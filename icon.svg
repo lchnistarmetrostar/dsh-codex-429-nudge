@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#0f172a"/>
+  <circle cx="32" cy="29" r="13" fill="none" stroke="#38bdf8" stroke-width="4"
+          stroke-dasharray="17 7" stroke-linecap="round"/>
+  <path d="M45 20l4 7-8 1" fill="none" stroke="#38bdf8" stroke-width="4"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="32" y="57" font-size="12" fill="#7dd3fc" text-anchor="middle"
+        font-family="Segoe UI, sans-serif">429</text>
+</svg>

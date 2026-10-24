@@ -1,0 +1,36 @@
+{
+  "name": "dsh-codex-429-nudge",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "Codex 429 自动重试：检测 Codex 应用因上游 429 卡住，自动替你点「继续」",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "bin/codex-429-nudge.ps1"
+  ],
+  "license": "MIT"
+}
