@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-429-nudge",
-  "version": "0.1.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Codex 429 自动重试：检测 Codex 应用因上游 429 卡住，自动替你点「继续」",
