@@ -4,21 +4,34 @@
 # 动作：优先点"恢复目标"按钮；否则往输入框填"继续"并发送。
 param(
     [int]$IntervalSeconds = 300,   # 检查间隔
-    [int]$MaxAttempts = 6,         # 最多自动重试几次
+    [int]$MaxAttempts = 6,         # 最多自动重试几次；<=0 表示不限
     [switch]$DryRun,               # 只看不动手
     [switch]$Once,                 # 只检查一轮
     [string]$WindowKeyword = 'ChatGPT',  # 认哪个窗口：进程名或标题含它就当 Codex，可用 | 分隔多个
     [switch]$Notify,               # 救不回来时弹桌面通知（插件每轮传，手动跑时不传）
     [int]$ScanRecent = 0,          # 每轮额外翻几个"屏幕上看得见的"会话（0 = 只盯当前会话）
     [string]$WatchSessions = '',   # 还要盯哪几个会话，标题用 ; 分隔
-    [int]$ScanIntervalSeconds = 600 # 翻会话的最小间隔，别每轮都翻
+    [int]$ScanIntervalSeconds = 600, # 翻会话的最小间隔，别每轮都翻
+    [string]$ConfigFile = '',      # 独立版的配置文件（JSON）；给了就用它覆盖上面的参数
+    [string]$DataDir = '',         # 独立版的数据目录（日志、记住的会话）；空则沿用 ~/.dsh/codex-429-nudge
+    [switch]$Tray                  # 显示托盘图标（独立版用）
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
-$script:LogPath = Join-Path $PSScriptRoot 'nudge.log'
+# 数据目录：独立版由启动器指定（-DataDir），插件版沿用 ~/.dsh/codex-429-nudge。
+# 日志跟着数据目录走，免得装到只读位置时写不进去。
+if ($DataDir) {
+    $script:StateDir = $DataDir
+    New-Item -ItemType Directory -Force -Path $script:StateDir | Out-Null
+    $script:LogPath = Join-Path $script:StateDir 'nudge.log'
+}
+else {
+    $script:StateDir = Join-Path $env:USERPROFILE '.dsh\codex-429-nudge'
+    $script:LogPath = Join-Path $PSScriptRoot 'nudge.log'
+}
 
 function Log([string]$msg) {
     $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg
@@ -26,8 +39,67 @@ function Log([string]$msg) {
     try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 } catch { }
 }
 
-$script:StateDir = Join-Path $env:USERPROFILE '.dsh\codex-429-nudge'
 $script:NotifyStamp = Join-Path $script:StateDir '.last-notify'
+
+# 独立版的配置文件：给了 -ConfigFile 且文件存在就用它覆盖上面的命令行参数。
+# 这样"设置"和"日程"分开放，改完重启一下程序就生效，不用记命令行。
+if ($ConfigFile -and (Test-Path -LiteralPath $ConfigFile)) {
+    try {
+        $raw = Get-Content -LiteralPath $ConfigFile -Raw -Encoding UTF8
+        $c = $raw | ConvertFrom-Json
+        if ($null -ne $c.intervalSeconds) { $IntervalSeconds = [int]$c.intervalSeconds }
+        if ($null -ne $c.maxAttempts) { $MaxAttempts = [int]$c.maxAttempts }
+        if ($null -ne $c.windowKeyword -and "$($c.windowKeyword)".Trim()) { $WindowKeyword = [string]$c.windowKeyword }
+        if ($null -ne $c.scanRecent) { $ScanRecent = [int]$c.scanRecent }
+        if ($null -ne $c.watchSessions) { $WatchSessions = [string]$c.watchSessions }
+        if ($null -ne $c.scanIntervalSeconds) { $ScanIntervalSeconds = [int]$c.scanIntervalSeconds }
+        if ($null -ne $c.notify) { $Notify = [bool]$c.notify }
+        if ($null -ne $c.paused -and [bool]$c.paused) { $IntervalSeconds = 3600 }  # 暂停 = 只偶尔看一眼，不动作
+    }
+    catch {
+        Write-Host "配置文件读不了（$ConfigFile）：$($_.Exception.Message)，按命令行参数跑"
+    }
+}
+
+# 托盘图标：独立版用。没有它，别人装完就"看不见了"，也不知道怎么停。
+$script:TrayIcon = $null
+$script:Quit = $false
+function Start-TrayIcon {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        $script:TrayIcon = New-Object System.Windows.Forms.NotifyIcon
+        $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Shield
+        $script:TrayIcon.Text = 'Codex 自动继续'
+        $menu = New-Object System.Windows.Forms.ContextMenuStrip
+        $itemLog = $menu.Items.Add('打开日志')
+        $itemLog.Add_Click({ try { Start-Process notepad.exe -ArgumentList $script:LogPath } catch { } })
+        $itemCfg = $menu.Items.Add('打开设置文件')
+        if ($ConfigFile) { $itemCfg.Add_Click({ try { Start-Process notepad.exe -ArgumentList $ConfigFile } catch { } }) }
+        else { $itemCfg.Enabled = $false }
+        $itemDir = $menu.Items.Add('打开数据文件夹')
+        $itemDir.Add_Click({ try { Start-Process explorer.exe -ArgumentList $script:StateDir } catch { } })
+        $null = $menu.Items.Add('-')
+        $itemQuit = $menu.Items.Add('退出')
+        $itemQuit.Add_Click({ $script:Quit = $true })
+        $script:TrayIcon.ContextMenuStrip = $menu
+        $script:TrayIcon.Visible = $true
+        $script:TrayIcon.ShowBalloonTip(4000, 'Codex 自动继续', '已开始盯着 Codex。右击这个盾牌图标可以看日志或退出。', [System.Windows.Forms.ToolTipIcon]::Info)
+        Log '托盘图标已就绪（右击可看日志 / 退出）'
+    }
+    catch { Log "托盘图标起不来：$($_.Exception.Message)" }
+}
+
+function Pump-Tray { if ($script:TrayIcon) { try { [System.Windows.Forms.Application]::DoEvents() } catch { } } }
+
+# 主循环里的等待也走这个，顺便让托盘菜单能点得动
+function Wait-Tick([int]$seconds) {
+    for ($i = 0; $i -lt $seconds; $i++) {
+        if ($script:Quit) { return }
+        Start-Sleep -Seconds 1
+        Pump-Tray
+    }
+}
 
 # 救不回来时弹右下角通知。30 分钟内不重复弹，免得你人不在时一直响。
 function Send-FailNotice([string]$msg) {
@@ -166,6 +238,23 @@ function Find-SessionItem($win, [string]$title) {
     return $null
 }
 
+# 点完会话后界面要重新渲染。实测只等 900ms 常常还没切过去，会把"切过去了"误判成"没切过去"。
+# 只查 Document 一个元素，比全量 Get-CodexState 便宜得多。
+function Wait-DocTitle($win, [string]$title, [int]$timeoutMs = 6000) {
+    try {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Document)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+            $doc = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+            if ($doc -and [string]$doc.Current.Name -eq $title) { return $true }
+            Start-Sleep -Milliseconds 150
+        }
+    } catch { }
+    return $false
+}
+
 # 在侧栏找同名会话并点进去。
 # 实测（2026-10-25）：项滚出视野时 IsOffscreen=True，这时候 Invoke 会「返回成功但界面根本不切」。
 # 必须先 ScrollIntoView 让它真正进视野，再重新取一次元素（旧引用会失效），最后才点。
@@ -187,7 +276,9 @@ function Restore-Session($win, [string]$title) {
             if (-not $target) { Log "  侧栏里找不到会话「$title」"; return $false }
         }
 
-        return (Invoke-Button $target "会话「$title」")
+        $ok = Invoke-Button $target "会话「$title」"
+        if ($ok) { $null = Wait-DocTitle $win $title }
+        return $ok
     } catch {
         Log "  切回会话失败：$($_.Exception.Message)"
         return $false
@@ -515,7 +606,7 @@ function Scan-OtherSessions($win, [string]$original, [datetime]$lastAt) {
     foreach ($title in $cand) {
         if (([datetime]::Now - $lastAt).TotalSeconds -lt 60) { Log '  刚动过手，这轮不再翻'; break }
         if (-not (Restore-Session $win $title)) { Log ("  「{0}」点不动，跳过" -f $title); continue }
-        Start-Sleep -Milliseconds 900
+        $null = Wait-DocTitle $win $title
         try {
             $st = Get-CodexState $win
             if ([string]$st.DocTitle -ne $title) {
@@ -552,9 +643,24 @@ $lastActionAt = [datetime]::MinValue
 $lastScanAt = [datetime]::MinValue
 $lastResult = [pscustomobject]@{ found = $false; stalled = $false; acted = $false; failed = $false; running = $false; blank = $false; limit = $false; error = '' }
 
-Log "=== Codex 自动继续 启动 间隔=${IntervalSeconds}s 上限=${MaxAttempts}次 DryRun=$DryRun ==="
+$limitText = if ($MaxAttempts -gt 0) { "$MaxAttempts 次" } else { '不限' }
+Log "=== Codex 自动继续 启动 间隔=${IntervalSeconds}s 上限=$limitText DryRun=$DryRun Tray=$Tray ==="
+if ($Tray) {
+    # 托盘模式常驻，防重复：双击两次不要跑出两个进程抢着点按钮。
+    # （命名 Mutex 试过，实测两个实例都能起来；直接查进程更实在。）
+    try {
+        $others = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+            Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*-Tray*' -and $_.CommandLine -like '*codex-429-nudge.ps1*' -and $_.CommandLine -notlike '*-Command*' })
+        if ($others.Count -gt 0) {
+            Log "已经有一个「Codex 自动继续」在跑了（pid=$($others[0].ProcessId)），这次不重复启动"
+            return
+        }
+    } catch { }
+    Start-TrayIcon
+}
 
 while ($true) {
+    if ($script:Quit) { Log '收到退出指令，收工'; break }
     try {
         $win = Find-CodexWindow
         $lastResult.found = [bool]$win
@@ -578,7 +684,7 @@ while ($true) {
                 elseif ($typing) { Log ("  停在新聊天页，但输入框里有字（你可能正在写东西），不切：[{0}]" -f $(if ($typing.Length -gt 30) { $typing.Substring(0, 30) + '…' } else { $typing })) }
                 elseif ($DryRun) { Log "  [DryRun] 本应切回会话「$saved」再看一眼" }
                 elseif (Restore-Session $win $saved) {
-                    Start-Sleep -Milliseconds 900
+                    $null = Wait-DocTitle $win $saved
                     $st = Get-CodexState $win
                     Log ("  切回了会话「{0}」：内容={1} 运行中={2}" -f $st.DocTitle, $st.ContentCount, $st.Running)
                 }
@@ -616,7 +722,7 @@ while ($true) {
                  [bool]$st.StopButton, [bool]$st.Input, $st.GoalRunning, $st.DocTitle, $st.ContentCount, [bool]$st.LimitText)
 
             if ($stalled) {
-                if ($attempts -ge $MaxAttempts) {
+                if ($MaxAttempts -gt 0 -and $attempts -ge $MaxAttempts) {
                     Log "已达上限 $MaxAttempts 次，停止自动重试"
                     if (-not $Once) { break }
                 }
@@ -664,7 +770,10 @@ while ($true) {
         Write-Host ('RESULT ' + ($lastResult | ConvertTo-Json -Compress))
         break
     }
-    Start-Sleep -Seconds $IntervalSeconds
+    Wait-Tick $IntervalSeconds
 }
 
+if ($script:Tray) {
+    try { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() } catch { }
+}
 Log '=== 结束 ==='

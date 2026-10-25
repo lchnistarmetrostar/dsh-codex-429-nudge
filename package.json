@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-429-nudge",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Codex 自动继续：检测 Codex 应用因上游 429 或额度用尽而卡住，自动替你点「继续」；切走会话会自己找回来，多任务并行时逐个翻查",
@@ -30,7 +30,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "bin/codex-429-nudge.ps1"
+    "bin/codex-429-nudge.ps1",
+    "standalone/**"
   ],
   "license": "MIT"
 }

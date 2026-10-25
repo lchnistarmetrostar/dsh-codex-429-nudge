@@ -1,0 +1,10 @@
+{
+  "intervalSeconds": 300,
+  "maxAttempts": 0,
+  "windowKeyword": "ChatGPT",
+  "scanRecent": 5,
+  "watchSessions": "",
+  "scanIntervalSeconds": 600,
+  "notify": true,
+  "paused": false
+}
