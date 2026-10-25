@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Codex Auto-Resume",
-    "description": "Watches the Codex app: presses Continue when it stalls on upstream 429s or runs out of quota, and finds its way back to your task's conversation when you switch away or run several at once."
+    "description": "Watches the Codex app: presses Continue when it stalls on upstream 429s or runs out of quota, and finds its way back to your task's conversation when you switch away or run several at once. Also ships as a standalone, DSH-free portable build (Codex自动继续-免安装版.zip) — unzip and double-click."
   }
 }

@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Codex 自动继续：检测 Codex 应用因上游 429 或额度用尽而卡住，自动替你点「继续」；切走会话会自己找回来，多任务并行时逐个翻查",
+  "description": "Codex 自动继续：检测 Codex 应用因上游 429 或额度用尽而卡住，自动替你点「继续」；切走会话会自己找回来，多任务并行时逐个翻查。附赠免 DSH 免安装版（Codex自动继续-免安装版.zip），解压双击即用",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
@@ -31,7 +31,8 @@
     "locale/*.json",
     "icon.svg",
     "bin/codex-429-nudge.ps1",
-    "standalone/**"
+    "standalone/**",
+    "Codex自动继续-免安装版.zip"
   ],
   "license": "MIT"
 }
