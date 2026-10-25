@@ -112,6 +112,85 @@ function Wake-CodexWindow($win) {
     }
 }
 
+# ---- 切回上次那个会话 ----
+# 2026-10-25 实测：用户切到「新聊天」页之后，界面和"最小化/渲染坏了"在日志里一模一样
+# （内容=0、只有输入框、没有报错）。可这时候摇窗口没用 —— 摇了还是新聊天页。
+# 得把侧栏里那个会话点回来。侧栏每项是 ListItem 套 Button，name = 会话标题。
+$script:SessionFile = Join-Path $script:StateDir '.last-session'
+
+function Save-LastSession([string]$title) {
+    if (-not $title -or $title -eq 'ChatGPT') { return }
+    try {
+        New-Item -ItemType Directory -Force -Path $script:StateDir | Out-Null
+        Set-Content -LiteralPath $script:SessionFile -Value $title -Encoding UTF8
+    } catch { }
+}
+
+function Read-LastSession {
+    try {
+        if (Test-Path -LiteralPath $script:SessionFile) {
+            $v = (Get-Content -LiteralPath $script:SessionFile -Raw -Encoding UTF8).Trim()
+            if ($v) { return $v }
+        }
+    } catch { }
+    return ''
+}
+
+# 读输入框里有没有字。有字 = 你正在写东西，这时候绝不能把界面抢走。
+function Get-InputText($edit) {
+    if (-not $edit) { return '' }
+    $vp = Test-Pattern $edit ([System.Windows.Automation.ValuePattern]::Pattern)
+    if ($vp) {
+        try {
+            # 实测（2026-10-25）：Codex 的输入框是 contenteditable，空着的时候
+            # ValuePattern.Value 返回的是 **placeholder 文本**（"随心输入" / "和 Codex 一起工作"），
+            # 不是空串。所以要把这两种"假字"排掉，否则永远以为你在打字、永远不敢切会话。
+            $v = ([string]$vp.Current.Value).Trim()
+            if ($v -and $v -notmatch '^(和 Codex 一起工作|随心输入)$') { return $v }
+        } catch { }
+    }
+    return ''
+}
+
+# 在侧栏按名字找会话项（每个会话是 ListItem 套一个同名 Button）。
+function Find-SessionItem($win, [string]$title) {
+    $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition)
+    foreach ($e in $all) {
+        if ($e.Current.ControlType.ProgrammaticName -ne 'ControlType.Button') { continue }
+        if ([string]$e.Current.Name -eq $title) { return $e }
+    }
+    return $null
+}
+
+# 在侧栏找同名会话并点进去。
+# 实测（2026-10-25）：项滚出视野时 IsOffscreen=True，这时候 Invoke 会「返回成功但界面根本不切」。
+# 必须先 ScrollIntoView 让它真正进视野，再重新取一次元素（旧引用会失效），最后才点。
+function Restore-Session($win, [string]$title) {
+    try {
+        $target = Find-SessionItem $win $title
+        if (-not $target) { Log "  侧栏里找不到会话「$title」"; return $false }
+
+        if ($target.Current.IsOffscreen) {
+            $parent = $null
+            try { $parent = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($target) } catch { }
+            foreach ($node in @($target, $parent)) {
+                if (-not $node) { continue }
+                $sip = Test-Pattern $node ([System.Windows.Automation.ScrollItemPattern]::Pattern)
+                if ($sip) { try { $sip.ScrollIntoView() } catch { } }
+            }
+            Start-Sleep -Milliseconds 500
+            $target = Find-SessionItem $win $title
+            if (-not $target) { Log "  侧栏里找不到会话「$title」"; return $false }
+        }
+
+        return (Invoke-Button $target "会话「$title」")
+    } catch {
+        Log "  切回会话失败：$($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Test-Pattern($el, $pattern) {
     $obj = $null
     if ($el.TryGetCurrentPattern($pattern, [ref]$obj)) { return $obj }
@@ -206,6 +285,7 @@ function Get-CodexState($win) {
         GoalRunning  = $false    # 「进行中的目标」= 正常在推进，别动它
         GoalButton   = $null     # 按位置推断出来的 ▶
         Input        = $null
+        InputValue   = ''        # 输入框里已经有的字（判断"你是不是正在写东西"）
         LastTextY    = -1
         LastText     = ''
         LastErrorIndex   = -1
@@ -238,7 +318,10 @@ function Get-CodexState($win) {
             'ControlType.Edit' {
                 # 输入框 placeholder 会变（"和 Codex 一起工作" / "随心输入"），不能按固定名匹配。
                 # 取界面上第一个可见的 Edit。
-                if (-not $c.IsOffscreen -and -not $state.Input) { $state.Input = $e }
+                if (-not $c.IsOffscreen -and -not $state.Input) {
+                    $state.Input = $e
+                    $state.InputValue = Get-InputText $e
+                }
             }
             'ControlType.Text' {
                 if ($c.Name) {
@@ -333,9 +416,30 @@ while ($true) {
         }
         else {
             $st = Get-CodexState $win
+
+            # 有内容就记住"这是哪个会话"，等你切走了好找回来（见下面的 Restore-Session）
+            if ($st.ContentCount -gt 0 -and $st.DocTitle -and $st.DocTitle -ne 'ChatGPT') {
+                Save-LastSession $st.DocTitle
+            }
+
+            # 停在新聊天页：内容 0 条、只有输入框，跟"最小化/渲染坏"长得一模一样，
+            # 区别是摇窗口治不好。这里把上次那个会话点回来再看一眼。
+            if ($st.ContentCount -eq 0 -and $st.DocTitle -eq 'ChatGPT') {
+                $saved = Read-LastSession
+                $typing = $st.InputValue
+                if (-not $saved) { Log '  停在新聊天页，而且没记着上次在哪个会话' }
+                elseif ($typing) { Log ("  停在新聊天页，但输入框里有字（你可能正在写东西），不切：[{0}]" -f $(if ($typing.Length -gt 30) { $typing.Substring(0, 30) + '…' } else { $typing })) }
+                elseif ($DryRun) { Log "  [DryRun] 本应切回会话「$saved」再看一眼" }
+                elseif (Restore-Session $win $saved) {
+                    Start-Sleep -Milliseconds 900
+                    $st = Get-CodexState $win
+                    Log ("  切回了会话「{0}」：内容={1} 运行中={2}" -f $st.DocTitle, $st.ContentCount, $st.Running)
+                }
+            }
+
             # 2026-10-25 早上踩到的坑：整夜 210 轮读到的是"空界面"——输入框在，
             # 但对话内容一条都没有（ContentCount=0），于是每轮都判"一切正常"，白等 7 小时。
-            # 这里先兜一次：看到空界面就轻抖窗口逼它重绘，再读一遍。
+            # 这里再兜一次：切会话也没救回来的话，轻抖窗口逼它重绘。
             if (-not $st.Running -and $st.ErrorElements.Count -eq 0 -and -not $st.GoalText -and $st.ContentCount -eq 0) {
                 Log ("界面读不到对话内容（会话=[{0}] 内容=0 元素={1}）" -f $st.DocTitle, $st.TotalElements)
                 if ($DryRun) { Log '  [DryRun] 本应摇一下窗口试试' }
