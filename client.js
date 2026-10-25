@@ -58,6 +58,27 @@ window.__ModuleLoader__.load({
       return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`
     }
 
+    // "到点再试一次"（用户 2026-10-25 提的）：额度大概几点重置自己是知道的，
+    // 与其把次数耗在明知没用的时段，不如先睡到那个点再看一眼。保持原有固定间隔不动，这是额外加的一种触发。
+    // 支持三种写法：03:00（下一个 3 点）、+90（90 分钟后）、+3h（3 小时后）
+    function parseWake(text) {
+      const s = String(text || '').trim()
+      if (!s) return null
+      let m = s.match(/^\+\s*(\d+(?:\.\d+)?)\s*(h|小时)$/i)
+      if (m) return Date.now() + Math.round(Number(m[1]) * 3600_000)
+      m = s.match(/^\+\s*(\d+)\s*(m|分钟)?$/i)
+      if (m) return Date.now() + Number(m[1]) * 60_000
+      m = s.match(/^(\d{1,2})\s*[:：]\s*(\d{2})$/)
+      if (m) {
+        const d = new Date()
+        d.setSeconds(0, 0)
+        d.setHours(Number(m[1]), Number(m[2]))
+        if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1) // 今天的点已经过了 ⇒ 明天
+        return d.getTime()
+      }
+      return null
+    }
+
     async function jfetch(url, init) {
       const res = await fetch(url, { credentials: 'same-origin', ...(init || {}) })
       const data = await res.json().catch(() => ({}))
@@ -74,6 +95,7 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = React.useState(null)
       const [msg, setMsg] = React.useState('')
       const [busy, setBusy] = React.useState(false)
+      const [wakeText, setWakeText] = React.useState('')
 
       const load = React.useCallback(() => {
         jfetch(API + '/config')
@@ -205,6 +227,46 @@ window.__ModuleLoader__.load({
             h('button', { style: S.btn, disabled: busy, onClick: () => act('/config', { intervalSeconds: cfg.intervalSeconds, maxAttempts: cfg.maxAttempts }, '已保存') }, '保存'),
             h('button', { style: S.btn2, disabled: busy, onClick: () => act('/reset', undefined, '已重新开始一轮接管') }, '重新开始接管'),
           ),
+        ),
+
+        h('div', { style: S.sec },
+          h('div', { style: S.h }, '到点再试一次（可选）'),
+          h('div', { style: S.hint },
+            '额度大概什么时候重置，你心里有数；那就先睡到那个点再看一眼，别把次数耗在明知没用的时段。',
+            '到点试的这一下不占上面的次数——预算用完了也照样试。'),
+          Row({
+            children: [
+              h('div', { key: 't', style: S.title }, '时间'),
+              h('div', { key: 'd', style: S.hint }, '填 03:00，或 +90（90 分钟后）、+3h（3 小时后）。'),
+            ],
+            right: h('div', { style: S.row },
+              h('input', {
+                type: 'text', style: { ...S.num, width: 110 },
+                placeholder: '03:00 或 +90',
+                value: wakeText, disabled: busy,
+                onChange: (e) => setWakeText(e.target.value),
+              }),
+              h('button', {
+                style: S.btn2, disabled: busy,
+                onClick: () => {
+                  const ts = parseWake(wakeText)
+                  if (!ts) {
+                    setMsg('这个时间看不懂：填 03:00、+90、+3h 这样的')
+                    return
+                  }
+                  act('/config', { wakeAt: ts }, '已设定：' + clock(ts))
+                  setWakeText('')
+                },
+              }, '设定'),
+              cfg.wakeAt ? h('button', {
+                style: S.btn2, disabled: busy,
+                onClick: () => act('/config', { wakeAt: null }, '已取消定时'),
+              }, '取消') : null,
+            ),
+          }),
+          cfg.wakeAt
+            ? h('div', { style: S.hint }, `已设：${clock(cfg.wakeAt)}（还有 ${span(Math.max(0, cfg.wakeAt - Date.now()))}）`)
+            : null,
         ),
 
         h('div', { style: S.card },

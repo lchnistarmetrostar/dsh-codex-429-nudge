@@ -52,6 +52,66 @@ function Send-FailNotice([string]$msg) {
     }
 }
 
+# 窗口重绘用的最小 Win32 接口。只用三个函数，不需要 UIA 之外的其他依赖。
+if (-not ('CodexNudge.Win32' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace CodexNudge {
+    public static class Win32 {
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int X, int Y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    }
+}
+'@
+}
+
+$script:WakeStamp = Join-Path $script:StateDir '.last-wake'
+
+# 摇窗口要节流：界面长期空着（比如你就停在新聊天页）时，别每 5 分钟抖一次。
+function Should-Wake {
+    try {
+        if (Test-Path -LiteralPath $script:WakeStamp) {
+            $last = [datetime]::MinValue
+            $raw = (Get-Content -LiteralPath $script:WakeStamp -Raw).Trim()
+            if ([datetime]::TryParse($raw, [ref]$last) -and (([datetime]::Now - $last).TotalMinutes -lt 30)) { return $false }
+        }
+    } catch { }
+    try {
+        New-Item -ItemType Directory -Force -Path $script:StateDir | Out-Null
+        Set-Content -LiteralPath $script:WakeStamp -Value (Get-Date -Format 'o') -Encoding ASCII
+    } catch { }
+    return $true
+}
+
+# 界面读不到内容时，轻轻抖一下窗口：把宽高改 2px 再改回来，逼 WebView 重新渲染。
+# 不抢焦点、不动鼠标。实测过：只有改尺寸能触发重绘，移动窗口位置没用；PrintWindow 抓不到内容，靠不住。
+function Wake-CodexWindow($win) {
+    try {
+        $h = [IntPtr]$win.Current.NativeWindowHandle
+        if ($h -eq [IntPtr]::Zero) { return $false }
+        $r = New-Object CodexNudge.Win32+RECT
+        if (-not [CodexNudge.Win32]::GetWindowRect($h, [ref]$r)) { return $false }
+        $w = $r.Right - $r.Left
+        $ht = $r.Bottom - $r.Top
+        if ($w -le 100 -or $ht -le 100) { return $false }
+        $flags = [uint32]0x0014   # SWP_NOZORDER | SWP_NOACTIVATE
+        # SW_SHOWNOACTIVATE(4)：万一被最小化了先拉出来，但不抢焦点
+        [void][CodexNudge.Win32]::ShowWindow($h, 4)
+        Start-Sleep -Milliseconds 250
+        [void][CodexNudge.Win32]::SetWindowPos($h, [IntPtr]::Zero, $r.Left, $r.Top, ($w + 2), $ht, $flags)
+        Start-Sleep -Milliseconds 350
+        [void][CodexNudge.Win32]::SetWindowPos($h, [IntPtr]::Zero, $r.Left, $r.Top, $w, $ht, $flags)
+        Start-Sleep -Milliseconds 1200
+        return $true
+    } catch {
+        Log "  摇窗口失败：$($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Test-Pattern($el, $pattern) {
     $obj = $null
     if ($el.TryGetCurrentPattern($pattern, [ref]$obj)) { return $obj }
@@ -142,13 +202,17 @@ function Get-CodexState($win) {
         ContinueButton = $null   # "继续" 按钮（普通对话，输入框右下角黑色圆钮）
         SendButton   = $null
         StopButton   = $null
-        GoalText     = $null     # 「目标已停滞」那行字（Goal 模式专用）
+        GoalText     = $null     # 「目标已停滞」/「已暂停的目标」那行（= 要救的信号）
+        GoalRunning  = $false    # 「进行中的目标」= 正常在推进，别动它
         GoalButton   = $null     # 按位置推断出来的 ▶
         Input        = $null
         LastTextY    = -1
         LastText     = ''
         LastErrorIndex   = -1
         LastContentIndex = -1
+        ContentCount     = 0      # 读到的对话内容条数（正常界面几十上百条，空页面 = 0）
+        TotalElements    = 0
+        DocTitle         = ''     # 当前看的是哪个会话（Document 的 name）
     }
     $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
                         [System.Windows.Automation.Condition]::TrueCondition)
@@ -164,9 +228,10 @@ function Get-CodexState($win) {
                     '^恢复目标$|^继续目标$' { $state.ResumeButton = $e }
                     '^继续$'               { $state.ContinueButton = $e }
                     '^发送$|^提交$|^发送消息$' { $state.SendButton = $e }
-                    # 实测：Goal 模式下整条横幅本身就是一个 Button，名字以「目标已停滞」开头（或恢复后变「进行中的目标」）。
-                    # 记下它，好按位置去找它右边那个 ▶。
-                    '^(目标已停滞|已暂停的目标|进行中的目标)' { $state.GoalText = $e }
+                    # 实测：Goal 模式下整条横幅本身就是一个 Button，名字以「目标已停滞」/「已暂停的目标」开头。
+                    # 「进行中的目标」= 正常在推进，绝不能当成卡住。
+                    '^(目标已停滞|已暂停的目标)' { $state.GoalText = $e }
+                    '^进行中的目标' { $state.GoalRunning = $true }
                 }
             }
             'ControlType.Edit' {
@@ -187,6 +252,7 @@ function Get-CodexState($win) {
                     }
                     elseif ($c.Name.Length -gt 20) {
                         $state.LastContentIndex = $i
+                        $state.ContentCount++
                     }
                     try {
                         if (-not $c.IsOffscreen) {
@@ -201,12 +267,25 @@ function Get-CodexState($win) {
             }
         }
     }
+    $state.TotalElements = $all.Count
+    # 记下当前在看哪个会话：出问题时一眼看出是"窗口切走了"还是"界面没渲染出来"。
+    try {
+        $docCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Document)
+        $doc = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $docCond)
+        if ($doc) { $state.DocTitle = [string]$doc.Current.Name }
+    } catch { }
     if ($state.GoalText) { $state.GoalButton = Find-GoalButton $all $state.GoalText }
     return $state
 }
 
-# 判断：报错是否"最新"（在最后一条正常内容之后）
+# 判断：是不是卡住了
 function Test-Stalled($state) {
+    # Goal 模式：横幅直接写着「目标已停滞」或「已暂停的目标」，那就是卡了，不用再问别的。
+    # ⚠️ 这里不能沿用下面"报错是不是最后一条"的判断 —— 2026-10-25 早上实测：
+    #    目标暂停时，429 报错后面还挂着上一条正常回复，按顺序比会以为没卡住，白白放过一整夜。
+    if ($state.GoalText) { return $true }
     if ($state.Running) { return $false }
     if ($state.ErrorElements.Count -eq 0) { return $false }
     # 报错之后没有更新的正常内容 → 报错就是最后一条，说明卡住了
@@ -232,7 +311,7 @@ function Set-InputText($edit, [string]$text) {
 # ---------------- 主循环 ----------------
 $attempts = 0
 $lastActionAt = [datetime]::MinValue
-$lastResult = [pscustomobject]@{ found = $false; stalled = $false; acted = $false; failed = $false; running = $false; error = '' }
+$lastResult = [pscustomobject]@{ found = $false; stalled = $false; acted = $false; failed = $false; running = $false; blank = $false; error = '' }
 
 Log "=== Codex 429 自动重试器启动 间隔=${IntervalSeconds}s 上限=${MaxAttempts}次 DryRun=$DryRun ==="
 
@@ -245,16 +324,35 @@ while ($true) {
         }
         else {
             $st = Get-CodexState $win
+            # 2026-10-25 早上踩到的坑：整夜 210 轮读到的是"空界面"——输入框在，
+            # 但对话内容一条都没有（ContentCount=0），于是每轮都判"一切正常"，白等 7 小时。
+            # 这里先兜一次：看到空界面就轻抖窗口逼它重绘，再读一遍。
+            if (-not $st.Running -and $st.ErrorElements.Count -eq 0 -and -not $st.GoalText -and $st.ContentCount -eq 0) {
+                Log ("界面读不到对话内容（会话=[{0}] 内容=0 元素={1}）" -f $st.DocTitle, $st.TotalElements)
+                if ($DryRun) { Log '  [DryRun] 本应摇一下窗口试试' }
+                elseif (-not (Should-Wake)) { Log '  30 分钟内摇过了，这次不重复摇' }
+                elseif (Wake-CodexWindow $win) {
+                    $st2 = Get-CodexState $win
+                    if ($st2.ContentCount -gt 0 -or $st2.Running -or $st2.ErrorElements.Count -gt 0 -or $st2.GoalText) {
+                        Log ("  摇醒了：会话=[{0}] 内容={1}" -f $st2.DocTitle, $st2.ContentCount)
+                        $st = $st2
+                    }
+                    else {
+                        Log '  摇不醒，还是空的（可能就停在新聊天页，或者界面真没渲染出来）'
+                        $lastResult.blank = $true
+                    }
+                }
+            }
             $stalled = Test-Stalled $st
             $lastResult.stalled = $stalled
             $lastResult.running = $st.Running
             $lastResult.error = if ($st.ErrorElements.Count -gt 0) { $st.ErrorElements[0].Text } else { '' }
             $lastResult.acted = $false
             $lastResult.failed = $false
-            Log ("状态：运行中={0} 有报错={1} 判定卡住={2} 继续按钮={3} 恢复目标按钮={4} 目标横幅={5} 推断按钮={6} 停止按钮={7} 输入框={8}" -f `
+            Log ("状态：运行中={0} 最后有报错={1} 判定卡住={2} 继续按钮={3} 恢复目标按钮={4} 目标横幅={5} 推断按钮={6} 停止按钮={7} 输入框={8} 目标在跑={9} 会话=[{10}] 内容={11}" -f `
                  $st.Running, ($st.ErrorElements.Count -gt 0), $stalled,
                  [bool]$st.ContinueButton, [bool]$st.ResumeButton, [bool]$st.GoalText, [bool]$st.GoalButton,
-                 [bool]$st.StopButton, [bool]$st.Input)
+                 [bool]$st.StopButton, [bool]$st.Input, $st.GoalRunning, $st.DocTitle, $st.ContentCount)
 
             if ($stalled) {
                 if ($attempts -ge $MaxAttempts) {
@@ -265,7 +363,14 @@ while ($true) {
                     Log '  刚动过手，冷却中'
                 }
                 else {
-                    Log ("检测到 429 卡住：'{0}'" -f ($st.ErrorElements[0].Text))
+                    # 卡住的原因可能不是 429 报错（目标被暂停时就没有报错），所以别直接取 ErrorElements[0]
+                    $why = ''
+                    if ($st.GoalText) {
+                        $gn = [string]$st.GoalText.Current.Name
+                        $why = '目标横幅「' + $(if ($gn.Length -gt 20) { $gn.Substring(0, 20) + '…' } else { $gn }) + '」'
+                    }
+                    elseif ($st.ErrorElements.Count -gt 0) { $why = $st.ErrorElements[0].Text }
+                    Log ("检测到卡住：{0}" -f $why)
                     $done = $false
                     $failReason = ''
                     # 兜底链，从上往下试：
@@ -282,7 +387,19 @@ while ($true) {
 
                     if ($target) {
                         if ($DryRun) { Log "  [DryRun] 本应点击「$targetLabel」" }
-                        else { $done = Invoke-Button $target $targetLabel }
+                        else {
+                            $done = Invoke-Button $target $targetLabel
+                            if ($done) {
+                                # 点「恢复目标」有时会弹一个「恢复已暂停的目标吗？」确认框，
+                                # 那个框里的确认按钮叫「继续目标」，需要补一下。
+                                Start-Sleep -Milliseconds 800
+                                $again = Get-CodexState $win
+                                if ($again.ResumeButton -and ([string]$again.ResumeButton.Current.Name) -match '^继续目标$') {
+                                    Log '  弹出确认框，补点「继续目标」'
+                                    Invoke-Button $again.ResumeButton '继续目标' | Out-Null
+                                }
+                            }
+                        }
                         if (-not $done -and -not $DryRun) { $failReason = "「$targetLabel」点不动" }
                     }
                     elseif ($st.Input -and $st.SendButton) {

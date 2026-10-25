@@ -39,6 +39,9 @@ const DEFAULTS = {
   windowKeyword: 'ChatGPT',
   lastCheckAt: null,
   lastFound: false,
+  // 到点试一次：绝对时间戳（毫秒）。到点哪怕本轮预算已经用完，也照样试一次，这次不占预算。
+  // 用途：额度要几小时后才重置，先睡到那会儿再点，别把次数浪费在明知没用的时段。
+  wakeAt: null,
 }
 
 function log(msg) {
@@ -63,6 +66,12 @@ function clampCfg(raw) {
     ? c.windowKeyword.trim().slice(0, 120)
     : 'ChatGPT'
   const lastCheckAt = Number.isFinite(Number(c.lastCheckAt)) && Number(c.lastCheckAt) > 0 ? Number(c.lastCheckAt) : null
+  // 注意：过去的 wakeAt 不能被清掉 —— tick 正是靠"已到点"来判断要不要强制跑一次。
+  // 这里只挡掉明显不合理的值（非数字、太远）。
+  const wakeNum = Number(c.wakeAt)
+  const wakeAt = Number.isFinite(wakeNum) && wakeNum > 0 && wakeNum < Date.now() + 7 * 86400_000
+    ? Math.round(wakeNum)
+    : null
   return {
     enabled: Boolean(c.enabled),
     intervalSeconds,
@@ -72,6 +81,7 @@ function clampCfg(raw) {
     windowKeyword,
     lastCheckAt,
     lastFound: Boolean(c.lastFound),
+    wakeAt,
   }
 }
 
@@ -102,6 +112,8 @@ function statusOf(cfg) {
     exhausted: remainingAttempts === 0,
     running: cfg.enabled && remainingAttempts > 0,
     usedAttempts: cfg.usedAttempts,
+    // 到点试一次的时间点；界面上要显示"还剩多久"，所以放 status 里一起给
+    wakeAt: cfg.wakeAt,
   }
 }
 
@@ -147,15 +159,23 @@ export function apply(ctx) {
       timer = null
     }
     const cfg = loadCfg()
-    if (!statusOf(cfg).running) return
-    timer = setTimeout(tick, cfg.intervalSeconds * 1000)
+    const regular = statusOf(cfg).running ? cfg.intervalSeconds * 1000 : null
+    // 到点试一次的优先级高于常规节奏，而且预算用完了也照样排 —— 它就是为"预算花光了但额度快重置了"准备的
+    const wake = cfg.wakeAt === null ? null : Math.max(0, cfg.wakeAt - Date.now())
+    const delay = regular === null ? wake : (wake === null ? regular : Math.min(regular, wake))
+    if (delay === null) return
+    timer = setTimeout(tick, delay)
     timer.unref?.()
   }
 
   function tick() {
     const cfg = loadCfg()
-    if (!statusOf(cfg).running || busy) return
+    const st = statusOf(cfg)
+    // 到点强制跑：不看预算，跑完把 wakeAt 清掉（一次性）
+    const forced = cfg.wakeAt !== null && cfg.wakeAt <= Date.now() + 1000
+    if ((!st.running && !forced) || busy) return
     busy = true
+    if (forced) saveCfg({ wakeAt: null })
 
     // 判定只认 ASCII 字段（"acted":true 等），中文控制台会转 GBK，中文内容不可靠
     const child = spawn(
@@ -180,20 +200,31 @@ export function apply(ctx) {
       const acted = /"acted"\s*:\s*true/.test(out)
       const stalled = /"stalled"\s*:\s*true/.test(out)
       const found = /"found"\s*:\s*true/.test(out)
+      const blank = /"blank"\s*:\s*true/.test(out)
 
       // 把"刚才有没有认到 Codex 窗口"记下来，用户在设置页能一眼看出它在不在干活
       saveCfg({ lastCheckAt: Date.now(), lastFound: found })
       if (!found && !acted) log(`这一轮没找到 Codex 窗口（认的关键字：${fresh.windowKeyword}）`)
 
       if (acted) {
-        // ⭐ 恢复运行也不清零：花掉一次就是花掉一次（离开电脑时最怕的是"刚好又 429"）
-        const next = saveCfg({ usedAttempts: fresh.usedAttempts + 1 })
-        const left = Math.max(0, next.maxAttempts - next.usedAttempts)
-        if (left === 0) {
-          log(`已自动点「继续」：第 ${next.usedAttempts}/${next.maxAttempts} 次 —— 预算用完，停手`)
+        if (forced) {
+          // 到点试的这一下是预算之外的，不扣次数
+          log('到点试了一次：已帮你点「继续」（这次不占预算）')
         } else {
-          log(`已自动点「继续」：第 ${next.usedAttempts}/${next.maxAttempts} 次（还剩 ${left} 次）`)
+          // ⭐ 恢复运行也不清零：花掉一次就是花掉一次（离开电脑时最怕的是"刚好又 429"）
+          const next = saveCfg({ usedAttempts: fresh.usedAttempts + 1 })
+          const left = Math.max(0, next.maxAttempts - next.usedAttempts)
+          if (left === 0) {
+            log(`已自动点「继续」：第 ${next.usedAttempts}/${next.maxAttempts} 次 —— 预算用完，停手`)
+          } else {
+            log(`已自动点「继续」：第 ${next.usedAttempts}/${next.maxAttempts} 次（还剩 ${left} 次）`)
+          }
         }
+      } else if (forced) {
+        log('到点试了一次：Codex 没卡住，不用点')
+      } else if (blank) {
+        // 2026-10-25 早上就是这里漏了：整夜读到空界面，却当成"一切正常"，白等 7 小时。
+        log('这一轮读不到 Codex 的对话内容（可能停在新聊天页，或者界面没渲染），已经试着摇过窗口了')
       } else if (stalled) {
         log('看着像卡住了，但界面上没找到可点的按钮')
       } else if (code !== 0) {
@@ -219,7 +250,7 @@ export function apply(ctx) {
         if (req.method === 'POST' && url.pathname === API_PATH + '/config') {
           const body = await readBody(req)
           const patch = {}
-          for (const k of ['enabled', 'intervalSeconds', 'maxAttempts', 'windowKeyword']) if (k in body) patch[k] = body[k]
+          for (const k of ['enabled', 'intervalSeconds', 'maxAttempts', 'windowKeyword', 'wakeAt']) if (k in body) patch[k] = body[k]
 
           const before = loadCfg()
           const config = saveCfg(patch)
