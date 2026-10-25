@@ -1,4 +1,4 @@
-﻿# codex-429-nudge.ps1 — Codex 429 自动重试器（M1 原型）
+﻿# codex-429-nudge.ps1 — Codex 自动继续（429 / 额度用尽都救）
 # 机制：用 Windows 无障碍接口(UIA)直接读 Codex 窗口的界面文字与按钮，不需要截图、不占用鼠标。
 # 判据：界面里出现 429 报错 且 不在运行中(没有"停止"按钮) 且 429 是最新的内容 → 判定为"卡住了"。
 # 动作：优先点"恢复目标"按钮；否则往输入框填"继续"并发送。
@@ -47,7 +47,7 @@ function Send-FailNotice([string]$msg) {
         $ni = New-Object System.Windows.Forms.NotifyIcon
         $ni.Icon = [System.Drawing.SystemIcons]::Warning
         $ni.Visible = $true
-        $ni.ShowBalloonTip(15000, 'Codex 429：没救回来', $msg, [System.Windows.Forms.ToolTipIcon]::Warning)
+        $ni.ShowBalloonTip(15000, 'Codex 自动继续：没救回来', $msg, [System.Windows.Forms.ToolTipIcon]::Warning)
         Start-Sleep -Milliseconds 1500
         $ni.Dispose()
     } catch {
@@ -552,7 +552,7 @@ $lastActionAt = [datetime]::MinValue
 $lastScanAt = [datetime]::MinValue
 $lastResult = [pscustomobject]@{ found = $false; stalled = $false; acted = $false; failed = $false; running = $false; blank = $false; limit = $false; error = '' }
 
-Log "=== Codex 429 自动重试器启动 间隔=${IntervalSeconds}s 上限=${MaxAttempts}次 DryRun=$DryRun ==="
+Log "=== Codex 自动继续 启动 间隔=${IntervalSeconds}s 上限=${MaxAttempts}次 DryRun=$DryRun ==="
 
 while ($true) {
     try {
@@ -635,7 +635,7 @@ while ($true) {
                         $lastResult.failed = $true
                         Log "  没救成：$($script:LastFailReason)"
                         if ($Notify) {
-                            Send-FailNotice "Codex 卡在 429，插件没救回来：$($script:LastFailReason)。你可能得自己看一眼。"
+                            Send-FailNotice "Codex 卡住了（429 或额度用尽），插件没救回来：$($script:LastFailReason)。你可能得自己看一眼。"
                         }
                     }
                 }
