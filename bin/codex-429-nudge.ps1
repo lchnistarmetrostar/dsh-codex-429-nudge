@@ -213,6 +213,7 @@ function Get-CodexState($win) {
         ContentCount     = 0      # 读到的对话内容条数（正常界面几十上百条，空页面 = 0）
         TotalElements    = 0
         DocTitle         = ''     # 当前看的是哪个会话（Document 的 name）
+        LimitText        = $null  # 「你已达到使用上限…」= 额度用尽，不是 429，但同样要救
     }
     $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
                         [System.Windows.Automation.Condition]::TrueCondition)
@@ -241,6 +242,12 @@ function Get-CodexState($win) {
             }
             'ControlType.Text' {
                 if ($c.Name) {
+                    # 额度用尽不是 429，但从用户角度是同一件事：任务停了，得有人把它拉起来。
+                    # 只认完整长句（"你已达到使用上限…升级套餐或充值额度…"）；模型选择器里那条
+                    # 光秃秃的「已达到使用上限」是常驻提示，不能拿来当卡住的证据。
+                    if ($c.Name -match '你已达到使用上限|升级套餐或充值额度|或稍后再试|用量已尽') {
+                        if (-not $c.IsOffscreen) { $state.LimitText = $e }
+                    }
                     if ($c.Name -match '429|Too Many Requests|exceeded retry limit|使用上限') {
                         $state.ErrorElements += [pscustomobject]@{ Text = $c.Name; Index = $i }
                         $state.LastErrorIndex = $i
@@ -287,6 +294,8 @@ function Test-Stalled($state) {
     #    目标暂停时，429 报错后面还挂着上一条正常回复，按顺序比会以为没卡住，白白放过一整夜。
     if ($state.GoalText) { return $true }
     if ($state.Running) { return $false }
+    # 额度用尽同理：提示可能挂在对话末尾后面，按顺序比会漏掉，直接判卡住。
+    if ($state.LimitText) { return $true }
     if ($state.ErrorElements.Count -eq 0) { return $false }
     # 报错之后没有更新的正常内容 → 报错就是最后一条，说明卡住了
     return ($state.LastErrorIndex -gt $state.LastContentIndex)
@@ -311,7 +320,7 @@ function Set-InputText($edit, [string]$text) {
 # ---------------- 主循环 ----------------
 $attempts = 0
 $lastActionAt = [datetime]::MinValue
-$lastResult = [pscustomobject]@{ found = $false; stalled = $false; acted = $false; failed = $false; running = $false; blank = $false; error = '' }
+$lastResult = [pscustomobject]@{ found = $false; stalled = $false; acted = $false; failed = $false; running = $false; blank = $false; limit = $false; error = '' }
 
 Log "=== Codex 429 自动重试器启动 间隔=${IntervalSeconds}s 上限=${MaxAttempts}次 DryRun=$DryRun ==="
 
@@ -346,13 +355,14 @@ while ($true) {
             $stalled = Test-Stalled $st
             $lastResult.stalled = $stalled
             $lastResult.running = $st.Running
+            $lastResult.limit = [bool]$st.LimitText
             $lastResult.error = if ($st.ErrorElements.Count -gt 0) { $st.ErrorElements[0].Text } else { '' }
             $lastResult.acted = $false
             $lastResult.failed = $false
-            Log ("状态：运行中={0} 最后有报错={1} 判定卡住={2} 继续按钮={3} 恢复目标按钮={4} 目标横幅={5} 推断按钮={6} 停止按钮={7} 输入框={8} 目标在跑={9} 会话=[{10}] 内容={11}" -f `
+            Log ("状态：运行中={0} 最后有报错={1} 判定卡住={2} 继续按钮={3} 恢复目标按钮={4} 目标横幅={5} 推断按钮={6} 停止按钮={7} 输入框={8} 目标在跑={9} 会话=[{10}] 内容={11} 额度不足={12}" -f `
                  $st.Running, ($st.ErrorElements.Count -gt 0), $stalled,
                  [bool]$st.ContinueButton, [bool]$st.ResumeButton, [bool]$st.GoalText, [bool]$st.GoalButton,
-                 [bool]$st.StopButton, [bool]$st.Input, $st.GoalRunning, $st.DocTitle, $st.ContentCount)
+                 [bool]$st.StopButton, [bool]$st.Input, $st.GoalRunning, $st.DocTitle, $st.ContentCount, [bool]$st.LimitText)
 
             if ($stalled) {
                 if ($attempts -ge $MaxAttempts) {
@@ -368,6 +378,10 @@ while ($true) {
                     if ($st.GoalText) {
                         $gn = [string]$st.GoalText.Current.Name
                         $why = '目标横幅「' + $(if ($gn.Length -gt 20) { $gn.Substring(0, 20) + '…' } else { $gn }) + '」'
+                    }
+                    elseif ($st.LimitText) {
+                        $ln = [string]$st.LimitText.Current.Name
+                        $why = '额度用尽「' + $(if ($ln.Length -gt 24) { $ln.Substring(0, 24) + '…' } else { $ln }) + '」'
                     }
                     elseif ($st.ErrorElements.Count -gt 0) { $why = $st.ErrorElements[0].Text }
                     Log ("检测到卡住：{0}" -f $why)

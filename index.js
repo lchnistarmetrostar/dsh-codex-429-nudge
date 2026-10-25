@@ -201,24 +201,27 @@ export function apply(ctx) {
       const stalled = /"stalled"\s*:\s*true/.test(out)
       const found = /"found"\s*:\s*true/.test(out)
       const blank = /"blank"\s*:\s*true/.test(out)
+      // 额度用尽（不是 429，但同样是"任务停了"）
+      const limit = /"limit"\s*:\s*true/.test(out)
 
       // 把"刚才有没有认到 Codex 窗口"记下来，用户在设置页能一眼看出它在不在干活
       saveCfg({ lastCheckAt: Date.now(), lastFound: found })
       if (!found && !acted) log(`这一轮没找到 Codex 窗口（认的关键字：${fresh.windowKeyword}）`)
 
       if (acted) {
+        // 额度用尽和 429 是两回事：429 等一会儿多半就好了，额度用尽得等它重置。
+        // 所以这两种日志要分开写，用户翻日志时才知道该不该去设「到点再试一次」。
+        const what = limit ? '额度用尽，已帮你发起重试' : '已自动点「继续」'
         if (forced) {
           // 到点试的这一下是预算之外的，不扣次数
-          log('到点试了一次：已帮你点「继续」（这次不占预算）')
+          log(`到点试了一次：${limit ? '额度还没恢复，' : ''}已帮你点「继续」（这次不占预算）`)
         } else {
           // ⭐ 恢复运行也不清零：花掉一次就是花掉一次（离开电脑时最怕的是"刚好又 429"）
           const next = saveCfg({ usedAttempts: fresh.usedAttempts + 1 })
           const left = Math.max(0, next.maxAttempts - next.usedAttempts)
-          if (left === 0) {
-            log(`已自动点「继续」：第 ${next.usedAttempts}/${next.maxAttempts} 次 —— 预算用完，停手`)
-          } else {
-            log(`已自动点「继续」：第 ${next.usedAttempts}/${next.maxAttempts} 次（还剩 ${left} 次）`)
-          }
+          const tail = left === 0 ? ' —— 预算用完，停手' : `（还剩 ${left} 次）`
+          log(`${what}：第 ${next.usedAttempts}/${next.maxAttempts} 次${tail}`)
+          if (limit) log('  如果额度还没恢复，这次会白给；可以在设置里用「到点再试一次」定到重置时间')
         }
       } else if (forced) {
         log('到点试了一次：Codex 没卡住，不用点')
@@ -226,7 +229,7 @@ export function apply(ctx) {
         // 2026-10-25 早上就是这里漏了：整夜读到空界面，却当成"一切正常"，白等 7 小时。
         log('这一轮读不到 Codex 的对话内容（可能停在新聊天页，或者界面没渲染），已经试着摇过窗口了')
       } else if (stalled) {
-        log('看着像卡住了，但界面上没找到可点的按钮')
+        log(limit ? '额度用尽，但界面上没找到可点的按钮（可能被弹窗挡住了）' : '看着像卡住了，但界面上没找到可点的按钮')
       } else if (code !== 0) {
         log(`脚本退出码 ${code}`)
       }
