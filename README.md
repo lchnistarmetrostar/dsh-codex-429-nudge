@@ -1,6 +1,6 @@
-# Codex 自动重试（dsh-codex-429-nudge）
+# Codex 自动继续（dsh-codex-429-nudge）
 
-盯住 Codex 桌面应用，一旦它被上游 **429 Too Many Requests** 或者**额度用尽**卡住，就替你点那个恢复按钮。
+盯住 Codex 桌面应用，一旦它被上游 **429 Too Many Requests** 或者**额度用尽**卡住，就替你点那个恢复按钮。你切到别的会话去了，它会把任务那个会话找回来；同时开了好几个任务，它也会挨个翻一眼。
 
 不用鼠标、不抢焦点，你在别处打字也不会被打断。给的是"人离开电脑时替你看着"这件事。
 
@@ -8,7 +8,7 @@
 
 1. 克隆下来：`git clone https://github.com/lchnistarmetrostar/dsh-codex-429-nudge`
 2. 在 DSH 里让 AI 把这个目录装成插件（说一句「把 `<目录>` 装成插件」就行）
-3. 进 **设置 → Codex 429 重试**，打开总开关
+3. 进 **设置 → Codex 自动继续**，打开总开关
 
 只需要 Windows 自带的 PowerShell，不用装任何东西。
 

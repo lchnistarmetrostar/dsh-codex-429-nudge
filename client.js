@@ -346,7 +346,7 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         const slots = ctx.get('slots')
         slots.inject('settings.section', () => slots.register(
-          { name: 'settings.section', id: 'codex-429-nudge', order: 32, label: 'Codex 429 重试' },
+          { name: 'settings.section', id: 'codex-429-nudge', order: 32, label: 'Codex 自动继续' },
           () => h(Panel),
         ))
       },

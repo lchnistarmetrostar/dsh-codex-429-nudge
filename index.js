@@ -307,5 +307,5 @@ export function apply(ctx) {
   const st = statusOf(cfg)
   log(st.running
     ? `已启动：每 ${cfg.intervalSeconds} 秒看一眼，本轮还剩 ${st.remainingAttempts}/${cfg.maxAttempts} 次`
-    : (cfg.enabled ? '已启动，但本轮预算用完了（点「重新开始接管」）' : '插件已加载，总开关关着（设置 → Codex 429 重试 里打开）'))
+    : (cfg.enabled ? '已启动，但本轮预算用完了（点「重新开始接管」）' : '插件已加载，总开关关着（设置 → Codex 自动继续 里打开）'))
 }
