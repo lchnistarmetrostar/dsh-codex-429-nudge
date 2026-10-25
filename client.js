@@ -185,6 +185,54 @@ window.__ModuleLoader__.load({
         ),
 
         h('div', { style: S.sec },
+          h('div', { style: S.h }, '多盯几路会话'),
+          h('div', { style: S.hint },
+            'Codex 一次只显示一个会话，所以默认只盯当前显示的那个。',
+            '你要是同时开了好几个任务，可以让它额外去翻别的会话 —— 只在当前会话空闲时翻，翻完会切回你原来那个。'),
+          Row({
+            children: [
+              h('div', { key: 't', style: S.title }, '额外翻几个会话'),
+              h('div', { key: 'd', style: S.hint }, '每次去翻「屏幕上看得见」的会话，0 = 只盯当前那个。'),
+            ],
+            right: h('div', { style: S.row },
+              h('input', {
+                type: 'number', min: 0, max: 20, step: 1,
+                style: { ...S.num, width: 70 },
+                value: cfg.scanRecent ?? 5,
+                disabled: busy,
+                onChange: (e) => setCfg({ ...cfg, scanRecent: e.target.value }),
+              }),
+              h('button', {
+                style: S.btn2,
+                disabled: busy,
+                onClick: () => act('/config', { scanRecent: Number(cfg.scanRecent) }, '已保存要翻几个会话'),
+              }, '保存'),
+            ),
+          }),
+          Row({
+            children: [
+              h('div', { key: 't', style: S.title }, '还要盯哪几个'),
+              h('div', { key: 'd', style: S.hint }, '写侧栏里显示的会话标题，用 ; 分隔。找不到的会跳过。'),
+            ],
+            right: h('div', { style: S.row },
+              h('input', {
+                type: 'text',
+                style: { ...S.num, width: 220 },
+                placeholder: '会话标题;另一个标题',
+                value: cfg.watchSessions ?? '',
+                disabled: busy,
+                onChange: (e) => setCfg({ ...cfg, watchSessions: e.target.value }),
+              }),
+              h('button', {
+                style: S.btn2,
+                disabled: busy,
+                onClick: () => act('/config', { watchSessions: cfg.watchSessions }, '已保存要盯的会话'),
+              }, '保存'),
+            ),
+          }),
+        ),
+
+        h('div', { style: S.sec },
           h('div', { style: S.h }, '接管多久（档位）'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             ...PRESETS.map((p) => h('button', {

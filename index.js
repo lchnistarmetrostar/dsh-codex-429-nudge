@@ -42,6 +42,11 @@ const DEFAULTS = {
   // 到点试一次：绝对时间戳（毫秒）。到点哪怕本轮预算已经用完，也照样试一次，这次不占预算。
   // 用途：额度要几小时后才重置，先睡到那会儿再点，别把次数浪费在明知没用的时段。
   wakeAt: null,
+  // Codex 一次只显示一个会话，默认只盯当前那个。下面两个让你多盯几路：
+  // scanRecent = 每次额外翻几个「屏幕上看得见的」会话（0 = 只盯当前会话）
+  scanRecent: 5,
+  // watchSessions = 另外指定要盯的会话标题，用 ; 分隔
+  watchSessions: '',
 }
 
 function log(msg) {
@@ -66,6 +71,8 @@ function clampCfg(raw) {
     ? c.windowKeyword.trim().slice(0, 120)
     : 'ChatGPT'
   const lastCheckAt = Number.isFinite(Number(c.lastCheckAt)) && Number(c.lastCheckAt) > 0 ? Number(c.lastCheckAt) : null
+  const scanRecent = Math.min(20, Math.max(0, Math.round(Number(c.scanRecent) || 0)))
+  const watchSessions = typeof c.watchSessions === 'string' ? c.watchSessions.trim().slice(0, 2000) : ''
   // 注意：过去的 wakeAt 不能被清掉 —— tick 正是靠"已到点"来判断要不要强制跑一次。
   // 这里只挡掉明显不合理的值（非数字、太远）。
   const wakeNum = Number(c.wakeAt)
@@ -82,6 +89,8 @@ function clampCfg(raw) {
     lastCheckAt,
     lastFound: Boolean(c.lastFound),
     wakeAt,
+    scanRecent,
+    watchSessions,
   }
 }
 
@@ -178,11 +187,10 @@ export function apply(ctx) {
     if (forced) saveCfg({ wakeAt: null })
 
     // 判定只认 ASCII 字段（"acted":true 等），中文控制台会转 GBK，中文内容不可靠
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Once', '-WindowKeyword', cfg.windowKeyword],
-      { windowsHide: true },
-    )
+    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+      '-Once', '-WindowKeyword', cfg.windowKeyword, '-ScanRecent', String(cfg.scanRecent)]
+    if (cfg.watchSessions) args.push('-WatchSessions', cfg.watchSessions)
+    const child = spawn('powershell.exe', args, { windowsHide: true })
 
     let out = ''
     child.stdout.on('data', (b) => { out += b.toString('utf8') })
@@ -254,7 +262,7 @@ export function apply(ctx) {
         if (req.method === 'POST' && url.pathname === API_PATH + '/config') {
           const body = await readBody(req)
           const patch = {}
-          for (const k of ['enabled', 'intervalSeconds', 'maxAttempts', 'windowKeyword', 'wakeAt']) if (k in body) patch[k] = body[k]
+          for (const k of ['enabled', 'intervalSeconds', 'maxAttempts', 'windowKeyword', 'wakeAt', 'scanRecent', 'watchSessions']) if (k in body) patch[k] = body[k]
 
           const before = loadCfg()
           const config = saveCfg(patch)

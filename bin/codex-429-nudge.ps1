@@ -8,7 +8,10 @@ param(
     [switch]$DryRun,               # 只看不动手
     [switch]$Once,                 # 只检查一轮
     [string]$WindowKeyword = 'ChatGPT',  # 认哪个窗口：进程名或标题含它就当 Codex，可用 | 分隔多个
-    [switch]$Notify                # 救不回来时弹桌面通知（插件每轮传，手动跑时不传）
+    [switch]$Notify,               # 救不回来时弹桌面通知（插件每轮传，手动跑时不传）
+    [int]$ScanRecent = 0,          # 每轮额外翻几个"屏幕上看得见的"会话（0 = 只盯当前会话）
+    [string]$WatchSessions = '',   # 还要盯哪几个会话，标题用 ; 分隔
+    [int]$ScanIntervalSeconds = 600 # 翻会话的最小间隔，别每轮都翻
 )
 
 $ErrorActionPreference = 'Stop'
@@ -400,9 +403,153 @@ function Set-InputText($edit, [string]$text) {
     return $true
 }
 
+# ---------------- 卡住时的动作链 ----------------
+# 从主循环里抽出来的：「翻别的会话」时也要用同一套动作，不能有两份。
+# 返回 $true = 点下去了（确认框也补点了），$false = 没点成。
+# 没点成的原因放在 $script:LastFailReason 里。
+function Invoke-Fix($win, $st) {
+    $script:LastFailReason = ''
+    $why = ''
+    if ($st.GoalText) {
+        $gn = [string]$st.GoalText.Current.Name
+        $why = '目标横幅「' + $(if ($gn.Length -gt 20) { $gn.Substring(0, 20) + '…' } else { $gn }) + '」'
+    }
+    elseif ($st.LimitText) {
+        $ln = [string]$st.LimitText.Current.Name
+        $why = '额度用尽「' + $(if ($ln.Length -gt 24) { $ln.Substring(0, 24) + '…' } else { $ln }) + '」'
+    }
+    elseif ($st.ErrorElements.Count -gt 0) { $why = $st.ErrorElements[0].Text }
+    Log ("检测到卡住：{0}" -f $why)
+
+    # 兜底链，从上往下试：
+    #   1) 普通对话 → 输入框右下角黑色圆钮，UIA name = '继续'（已实测有效）
+    #   2) 目标模式 → 名字叫 '恢复目标' / '继续目标' 的按钮
+    #   3) 目标模式 → 名字判断不了就按位置抓「目标已停滞」右边那个 ▶
+    #   4) 都没有 → 往输入框写"继续"再点发送
+    #   5) 还是不行 → 记原因 + 弹通知（你在不在电脑前都得知道）
+    $target = $null
+    $targetLabel = ''
+    if ($st.ContinueButton) { $target = $st.ContinueButton; $targetLabel = '继续' }
+    elseif ($st.ResumeButton) { $target = $st.ResumeButton; $targetLabel = '恢复目标' }
+    elseif ($st.GoalButton) { $target = $st.GoalButton; $targetLabel = '目标横幅右侧的按钮' }
+
+    if ($target) {
+        if ($DryRun) { Log "  [DryRun] 本应点击「$targetLabel」"; return $false }
+        $done = Invoke-Button $target $targetLabel
+        if ($done) {
+            # 点「恢复目标」有时会弹一个「恢复已暂停的目标吗？」确认框，
+            # 那个框里的确认按钮叫「继续目标」，需要补一下。
+            Start-Sleep -Milliseconds 800
+            $again = Get-CodexState $win
+            if ($again.ResumeButton -and ([string]$again.ResumeButton.Current.Name) -match '^继续目标$') {
+                Log '  弹出确认框，补点「继续目标」'
+                Invoke-Button $again.ResumeButton '继续目标' | Out-Null
+            }
+        }
+        if (-not $done) { $script:LastFailReason = "「$targetLabel」点不动" }
+        return $done
+    }
+
+    if ($st.Input -and $st.SendButton) {
+        Log '  没找到现成的恢复按钮，改用"发继续"兜底方案'
+        if ($DryRun) { Log '  [DryRun] 跳过填写与发送'; return $false }
+        $done = $false
+        $okInput = Set-InputText $st.Input '继续'
+        Start-Sleep -Milliseconds 400
+        if ($okInput) { $done = Invoke-Button $st.SendButton '发送' }
+        if (-not $done) { $script:LastFailReason = '往输入框写"继续"或点发送没成功' }
+        return $done
+    }
+
+    Log '  界面里没找到可用的按钮或输入框'
+    $script:LastFailReason = '界面上既没有恢复按钮，也没有能用的输入框'
+    return $false
+}
+
+# ---------------- 翻别的会话 ----------------
+# Codex 一次只显示一个会话，所以只盯当前那个会漏掉别的任务。这里每隔一段时间去翻一遍：
+# 先翻你指定的（WatchSessions），再翻屏幕上看得见的几个；翻完把界面切回原来那个。
+function Get-SessionCandidates($win, [string]$current) {
+    $list = New-Object System.Collections.ArrayList
+    foreach ($t in ($WatchSessions -split ';')) {
+        $t = $t.Trim()
+        if ($t -and $t -ne $current -and -not $list.Contains($t)) { [void]$list.Add($t) }
+    }
+    if ($ScanRecent -gt 0) {
+        $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                            [System.Windows.Automation.Condition]::TrueCondition)
+        $taken = 0
+        # 真会话项 = ListItem 且有一个同名 Button。项目分组项（名字是把几个会话名拼在一起的
+        # 那种）只有 ListItem、没有 Button，靠这一条就能把它排掉。
+        $hasButton = @{}
+        foreach ($e in $all) {
+            if ($e.Current.ControlType.ProgrammaticName -eq 'ControlType.Button') {
+                $hasButton[[string]$e.Current.Name] = $true
+            }
+        }
+        foreach ($e in $all) {
+            if ($taken -ge $ScanRecent) { break }
+            $c = $e.Current
+            if ($c.ControlType.ProgrammaticName -ne 'ControlType.ListItem') { continue }
+            if ($c.IsOffscreen) { continue }
+            $n = [string]$c.Name
+            if (-not $n -or -not $hasButton.ContainsKey($n)) { continue }
+            if ($n -eq $current -or $list.Contains($n)) { continue }
+            [void]$list.Add($n)
+            $taken++
+        }
+    }
+    return $list
+}
+
+# 返回这一次翻会话里成功发起了几次重试。
+function Scan-OtherSessions($win, [string]$original, [datetime]$lastAt) {
+    $cand = Get-SessionCandidates $win $original
+    if ($cand.Count -eq 0) { return 0 }
+    if ($DryRun) {
+        Log ("  [DryRun] 本应翻一遍这些会话：{0}" -f ($cand -join ' | '))
+        return 0
+    }
+    Log ("开始翻会话（{0} 个）：{1}" -f $cand.Count, ($cand -join ' | '))
+    $hit = 0
+    foreach ($title in $cand) {
+        if (([datetime]::Now - $lastAt).TotalSeconds -lt 60) { Log '  刚动过手，这轮不再翻'; break }
+        if (-not (Restore-Session $win $title)) { Log ("  「{0}」点不动，跳过" -f $title); continue }
+        Start-Sleep -Milliseconds 900
+        try {
+            $st = Get-CodexState $win
+            if ([string]$st.DocTitle -ne $title) {
+                Log ("  「{0}」没切过去（读到的是「{1}」），跳过" -f $title, $st.DocTitle)
+                continue
+            }
+            if (-not (Test-Stalled $st)) {
+                Log ("  「{0}」正常：内容={1} 运行中={2}" -f $title, $st.ContentCount, $st.Running)
+                continue
+            }
+            Log ("  会话「{0}」卡住了" -f $title)
+            if (Invoke-Fix $win $st) {
+                $hit++
+                $lastAt = [datetime]::Now
+                Log ("  已替会话「{0}」发起重试" -f $title)
+            }
+        } catch { Log ("  翻「{0}」出错：{1}" -f $title, $_.Exception.Message) }
+    }
+    # 翻完切回你原来在看的那个
+    if ($original -and $original -ne 'ChatGPT') {
+        if (Restore-Session $win $original) {
+            Start-Sleep -Milliseconds 700
+            $back = Get-CodexState $win
+            Log ("  已切回「{0}」（内容={1}）" -f $back.DocTitle, $back.ContentCount)
+        }
+        else { Log ("  没能切回「{0}」" -f $original) }
+    }
+    return $hit
+}
+
 # ---------------- 主循环 ----------------
 $attempts = 0
 $lastActionAt = [datetime]::MinValue
+$lastScanAt = [datetime]::MinValue
 $lastResult = [pscustomobject]@{ found = $false; stalled = $false; acted = $false; failed = $false; running = $false; blank = $false; limit = $false; error = '' }
 
 Log "=== Codex 429 自动重试器启动 间隔=${IntervalSeconds}s 上限=${MaxAttempts}次 DryRun=$DryRun ==="
@@ -477,75 +624,33 @@ while ($true) {
                     Log '  刚动过手，冷却中'
                 }
                 else {
-                    # 卡住的原因可能不是 429 报错（目标被暂停时就没有报错），所以别直接取 ErrorElements[0]
-                    $why = ''
-                    if ($st.GoalText) {
-                        $gn = [string]$st.GoalText.Current.Name
-                        $why = '目标横幅「' + $(if ($gn.Length -gt 20) { $gn.Substring(0, 20) + '…' } else { $gn }) + '」'
-                    }
-                    elseif ($st.LimitText) {
-                        $ln = [string]$st.LimitText.Current.Name
-                        $why = '额度用尽「' + $(if ($ln.Length -gt 24) { $ln.Substring(0, 24) + '…' } else { $ln }) + '」'
-                    }
-                    elseif ($st.ErrorElements.Count -gt 0) { $why = $st.ErrorElements[0].Text }
-                    Log ("检测到卡住：{0}" -f $why)
-                    $done = $false
-                    $failReason = ''
-                    # 兜底链，从上往下试：
-                    #   1) 普通对话 → 输入框右下角黑色圆钮，UIA name = '继续'（已实测有效）
-                    #   2) 目标模式 → 名字叫 '恢复目标' / '继续目标' 的按钮
-                    #   3) 目标模式 → 名字判断不了就按位置抓「目标已停滞」右边那个 ▶
-                    #   4) 都没有 → 往输入框写"继续"再点发送
-                    #   5) 还是不行 → 记原因 + 弹通知（你在不在电脑前都得知道）
-                    $target = $null
-                    $targetLabel = ''
-                    if ($st.ContinueButton) { $target = $st.ContinueButton; $targetLabel = '继续' }
-                    elseif ($st.ResumeButton) { $target = $st.ResumeButton; $targetLabel = '恢复目标' }
-                    elseif ($st.GoalButton) { $target = $st.GoalButton; $targetLabel = '目标横幅右侧的按钮' }
-
-                    if ($target) {
-                        if ($DryRun) { Log "  [DryRun] 本应点击「$targetLabel」" }
-                        else {
-                            $done = Invoke-Button $target $targetLabel
-                            if ($done) {
-                                # 点「恢复目标」有时会弹一个「恢复已暂停的目标吗？」确认框，
-                                # 那个框里的确认按钮叫「继续目标」，需要补一下。
-                                Start-Sleep -Milliseconds 800
-                                $again = Get-CodexState $win
-                                if ($again.ResumeButton -and ([string]$again.ResumeButton.Current.Name) -match '^继续目标$') {
-                                    Log '  弹出确认框，补点「继续目标」'
-                                    Invoke-Button $again.ResumeButton '继续目标' | Out-Null
-                                }
-                            }
-                        }
-                        if (-not $done -and -not $DryRun) { $failReason = "「$targetLabel」点不动" }
-                    }
-                    elseif ($st.Input -and $st.SendButton) {
-                        Log '  没找到现成的恢复按钮，改用"发继续"兜底方案'
-                        if (-not $DryRun) {
-                            $okInput = Set-InputText $st.Input '继续'
-                            Start-Sleep -Milliseconds 400
-                            if ($okInput) { $done = Invoke-Button $st.SendButton '发送' }
-                            if (-not $done) { $failReason = '往输入框写"继续"或点发送没成功' }
-                        }
-                        else { Log '  [DryRun] 跳过填写与发送' }
-                    }
-                    else {
-                        Log '  界面里没找到可用的按钮或输入框'
-                        $failReason = '界面上既没有恢复按钮，也没有能用的输入框'
-                    }
+                    $done = Invoke-Fix $win $st
                     if ($done) {
                         $lastResult.acted = $true
                         $attempts++
                         $lastActionAt = [datetime]::Now
                         Log "  第 $attempts/$MaxAttempts 次自动重试已发出"
                     }
-                    elseif ($failReason -and -not $DryRun) {
+                    elseif ($script:LastFailReason -and -not $DryRun) {
                         $lastResult.failed = $true
-                        Log "  没救成：$failReason"
+                        Log "  没救成：$($script:LastFailReason)"
                         if ($Notify) {
-                            Send-FailNotice "Codex 卡在 429，插件没救回来：$failReason。你可能得自己看一眼。"
+                            Send-FailNotice "Codex 卡在 429，插件没救回来：$($script:LastFailReason)。你可能得自己看一眼。"
                         }
+                    }
+                }
+            }
+
+            # 当前会话没卡住、也没在跑：隔一会儿去翻翻别的会话（你可能同时开了好几个任务）。
+            # 只在空闲时翻，免得打断正在跑的那个。
+            if (-not $stalled -and -not $st.Running -and ($ScanRecent -gt 0 -or $WatchSessions)) {
+                if (([datetime]::Now - $lastScanAt).TotalSeconds -ge $ScanIntervalSeconds) {
+                    $lastScanAt = [datetime]::Now
+                    $hit = Scan-OtherSessions $win $st.DocTitle $lastActionAt
+                    if ($hit -gt 0) {
+                        $lastResult.acted = $true
+                        $attempts += $hit
+                        $lastActionAt = [datetime]::Now
                     }
                 }
             }
